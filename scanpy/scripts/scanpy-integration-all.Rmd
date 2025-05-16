@@ -1,0 +1,369 @@
+---
+title: "snRNA-seq using dataset integration"
+output:
+    html_document:
+        code_folding: hide
+        toc: true
+        toc_float: true
+        toc_depth: 3
+        df_print: paged
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE,
+                      message=FALSE,
+                      cache.lazy=FALSE)
+```
+
+This workflow is designed to perform single cell RNA-seq (scRNA-seq) using 
+[scanpy](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-017-1382-0).
+
+```{r rpackages}
+library(reticulate)
+library(tidyr)
+library(dplyr)
+library(Seurat)
+library(ggplot2)
+library(cowplot)
+library(DT)
+library(plotly)
+library(readr)
+library(UpSetR)
+library(future)
+library(parallel)
+library(SingleCellExperiment)
+library(scater)
+library(Seurat)
+library(scuttle)
+library(purrr)
+library(anndata)
+library(viridis)
+source('../helpers.R')
+use_condaenv('../../env')
+```
+
+
+```{python ppackages, message=FALSE}
+# Import packages
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import seaborn as sns
+import matplotlib.pyplot as plt
+import anndata as ad
+import scvi
+import os
+import random
+import torch
+# Set seed number
+scvi.settings.seed = 0
+
+```
+
+```{python environmental_variables}
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['TORCH_CUDNN_V8_API_DISABLED'] = '1'
+```
+
+```{python configs}
+
+# Assign sample paths
+datatable_path = "sampletable.tsv"
+
+
+# Output directory
+output_dir = '../output/scanpy-integration-all'
+
+# Number of PCs to be accounted for UMAP
+npcs = 50
+
+# Assign resolution ranges for clustering
+resolutions = [0.6, 0.8, 1, 1.2, 1.4, 1.6, 1.8, 2.0]
+
+# Assign community detection algorithm
+# Options:
+# - leiden
+# - louvain
+comm_detection = 'leiden'
+
+# Assign the number of top variable features
+n_features = 3000
+
+# Create the output directory if it's not present yet
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+
+# Assign group levels
+group_levels = [
+    '5w_WT_M',
+    '5w_cKO_M',
+    '10w_WT_M',
+    '10w_cKO_M'
+    ]
+
+# Assign input adata path
+adata_path = '../output/scanpy-unintegrated-markers-all/adata_unintegrated_markers.h5ad'
+
+# Assign a list storing names of metadata columns for marker gene groups
+marker_groups = ['group', 'age', 'genotype', 'samplename', 'leiden_2.0']
+
+# Assign the number of CPUs available
+# (See https://hpc.nih.gov/apps/python.html for more info)
+ncpus = int(os.environ.get('SLURM_CPUS_PER_TASK', '2'))
+
+# Set min threshold filtering marker genes
+min_marker_l2fc = 0.25
+min_marker_fraction = 0.1
+alpha = 0.1 # FDR cutoff
+
+# Assign genes of interest
+genes = {
+    'cholinergic':['Chat'],
+    'visceral MNs':['Zeb2'],
+    'interneuron':['Pax2'],
+    'skeletal MNs':['Tns1'],
+    'alpha':['Rbfox3', 'Stk32a', 'Sv2b'],
+    'beta':['Gpr149'],
+    'gamma':['Nrp2', 'Pard3b']
+}
+
+# Assign whether GPU will be used
+# reticulate::repl_python()
+use_gpu = torch.cuda.is_available()
+```
+
+# Dataset
+
+Previously created `adata` object is loaded. We expect this object 
+to be QC-ed, dim-reduced, and clustered in the previous step.
+
+
+```{python import_adata}
+
+# Load adata object
+adata = sc.read_h5ad(adata_path)
+
+```
+
+## Table {.tabset}
+
+The number of cells are summarized in the following tables.
+
+```{r overview_table, results='asis'}
+
+# Extract metadata from the `adata` and slice columns of interest
+meta <- py$adata$obs[, py$marker_groups]
+
+# Loop over to display the number of cells across the categories in each column
+for (name in colnames(meta)) {
+    cat('###', name, '\n\n')
+    df <- as.data.frame(table(meta[[name]]))
+    colnames(df) <- c('Category', 'nCell')
+    subchunkify(paste0(name, '_overview_table'))
+    cat('\n\n')
+}
+```
+
+## Plot {.tabset}
+
+
+```{r overview_plot, results='asis'}
+
+for (name in colnames(meta)) {
+
+    cat('###', name, '\n\n')
+
+    # Extract and clean input data frame for metadata
+    df <- meta %>%
+        group_by_at(vars(name)) %>%
+        summarize(nCell=n())
+
+    # Plot
+    p <- ggplot(df, aes_string(x=name, y='nCell', fill=name)) +
+        geom_bar(stat='identity', width=0.5) +
+        theme_bw() +
+        theme(legend.title=element_blank(),
+              legend.position="none",
+              axis.text.x=element_text(angle=90, vjust=0.5, hjust=1))
+
+    subchunkify(paste0(name, '_overview_plot'),
+                input='plot',
+                10,
+                6,
+                ggplotly=FALSE)
+    cat('\n\n')
+}
+
+
+```
+
+
+# Integration using scVI
+
+Datasets are integrated using [scVI](https://pubmed.ncbi.nlm.nih.gov/30504886/).
+
+## Preprocessing
+
+Prior to integration, we re-run feature selection by replicate on **raw counts**. 
+It reduces the number of features used as input to the scvi-tools model.
+
+```{python prep_integration}
+
+# References:
+# - https://docs.scvi-tools.org/en/stable/tutorials/notebooks/quick_start/api_overview.html
+# - https://docs.scvi-tools.org/en/stable/tutorials/notebooks/scrna/harmonization.html
+
+# Keep unintegrated obj
+adata.raw = adata
+
+# Re-run feature selection on raw counts
+# NOTE:
+# - `layer`="counts" takes raw counts
+# - `subset`: Inplace subset to highly-variable genes 
+#    if True otherwise merely indicate highly variable genes.
+sc.pp.highly_variable_genes(
+    adata,
+    flavor="seurat_v3",
+    n_top_genes=n_features,
+    layer="counts",  # raw counts
+    subset=True,  # subsets only N highly variable genes
+    batch_key="samplename"
+)
+```
+
+## Integration and clustering
+
+```{python run_scvi}
+# reticulate::repl_python()
+# Initialize scvi
+# - Register the AnnData object with the correct key to identify 
+#   the sample and the layer key with the count data.
+# - Create an SCVI model object.
+scvi.model.SCVI.setup_anndata(
+    adata,
+    layer="counts",
+    batch_key="samplename"
+    )
+
+# Model scVI
+model = scvi.model.SCVI(
+    adata,
+    n_layers=2,
+    n_latent=30,
+    gene_likelihood="nb"
+    )
+
+# Assign accelerator
+acc = None
+if use_gpu: 
+    acc = 'gpu'
+
+# Train scVI
+# scvi.settings.batch_size returned 128
+model.train(
+    enable_progress_bar=False,
+    early_stopping=True,
+    accelerator=acc)
+```
+
+
+```{python integrated_clustering}
+
+# Save unintegrated umap to `X_unintegrated_umap`
+# NOTE: This is required not to lose unintegrated umap when saving integrated umap.
+adata.obsm['X_unintegrated_umap'] = adata.obsm['X_umap']
+
+# Add latent dimensions to the `adata`
+SCVI_LATENT_KEY = "X_scVI"
+adata.obsm[SCVI_LATENT_KEY] = model.get_latent_representation()
+
+# Re-generate UMAP using scVI latent space
+# Here umap the new umap is saved in adata.obsm['X_umap'].
+sc.pp.neighbors(adata, use_rep=SCVI_LATENT_KEY)
+sc.tl.umap(adata)
+
+for n in resolutions:
+    if comm_detection == 'leiden':
+        sc.tl.leiden(adata, resolution=n, key_added=f"scvi_{comm_detection}_{n}")
+    elif comm_detection == 'louvain':
+        sc.tl.louvain(adata, resolution=n, key_added=f"scvi_{comm_detection}_{n}")
+    else:
+        raise ValueError("Wrong community detection algorithm!")
+```
+
+```{python save_normalized_counts}
+SCVI_NORMALIZED_KEY = "scvi_normalized"
+adata.layers[SCVI_NORMALIZED_KEY] = model.get_normalized_expression(library_size=10e4)
+```
+
+```{r save_integrated_adata}
+write_h5ad(py$adata, file.path(py$output_dir, "adata_integrated.h5ad"))
+```
+
+
+## UMAP {.tabset}
+
+```{r integrated_umap, results='asis', fig.height=8, fig.width=10}
+
+# Extract umap coordinates from adata
+umap <- py$adata$obsm$X_umap
+
+# Extract metadata from adata
+meta <- py$adata$obs
+
+# Build input data frame for plotting
+u.df <- do.call(
+    "cbind",
+    list(as.data.frame(umap),
+         meta[, py$marker_groups],
+         meta %>% dplyr::select(starts_with('scvi')))
+    )
+
+colnames(u.df)[1:2] <- c("UMAP1", "UMAP2")
+
+# Print UMAP by metadata variable
+for (name in colnames(u.df %>% dplyr::select(-starts_with('UMAP')))) {
+
+    cat('###', name, '\n\n')
+    p <- ggplot(u.df, aes_string(x='UMAP1', y='UMAP2', color=name)) +
+        geom_point(size=0.1) +
+        theme_bw()
+
+    u.df2 <- u.df %>%
+        group_by_at(vars(name)) %>%
+        select(starts_with('UMAP')) %>%
+        summarize_all(mean)
+
+    if (class(u.df[[name]]) != "factor") {
+        p <- p + scale_color_viridis()
+    } else if (name %in% c('samplename', 'group')) {
+        p <- p + ggrepel::geom_label_repel(data=u.df2,
+                                           aes_string(label=name))
+
+    } else {
+        p <- p + geom_text(data=u.df2, color='black',
+                           aes_string(label=name))
+    }
+
+    cat('\n\n')
+    print(p)
+    cat('\n\n')
+
+    file.i <- file.path(py$output_dir,
+                        paste0(name, '_integrated_umap.pdf')
+                        )
+
+    ggsave(file.i, p, device='pdf', height=8, width=10)
+    link.plot(file.i)
+
+}
+```
+
+
+# Session info
+
+```{r session_info, collapse=FALSE}
+sessionInfo()
+```

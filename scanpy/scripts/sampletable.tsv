@@ -1,0 +1,9 @@
+samplename	age	genotype	sex	rep	data_path	group
+5w_WT_M_1	5w	WT	M	1	path/to/analysis/5wM_gene_wt_LS_a	5w_WT_M
+5w_WT_M_2	5w	WT	M	2	path/to/analysis/5wM_gene_wt_LS_b	5w_WT_M
+5w_cKO_M_1	5w	cKO	M	1	path/to/analysis/5wM_gene_cKO_LS_a	5w_cKO_M
+5w_cKO_M_2	5w	cKO	M	2	path/to/analysis/5wM_gene_cKO_LS_b	5w_cKO_M
+10w_WT_M_1	10w	WT	M	1	path/to/analysis/10wM_gene_wt_LS_a	10w_WT_M
+10w_WT_M_2	10w	WT	M	2	path/to/analysis/10wM_gene_wt_LS_b	10w_WT_M
+10w_cKO_M_1	10w	cKO	M	1	path/to/analysis/10wM_gene_cKO_LS_a	10w_cKO_M
+10w_cKO_M_2	10w	cKO	M	2	path/to/analysis/10wM_gene_cKO_LS_b	10w_cKO_M

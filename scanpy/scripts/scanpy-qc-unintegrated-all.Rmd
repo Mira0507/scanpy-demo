@@ -1,0 +1,716 @@
+---
+title: "snRNA-seq analysis using scanpy (without integration)"
+output:
+    html_document:
+        code_folding: hide
+        toc: true
+        toc_float: true
+        toc_depth: 3
+        df_print: paged
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE,
+                      message=FALSE,
+                      cache.lazy=FALSE)
+```
+
+This workflow is designed to perform single cell RNA-seq (scRNA-seq) using 
+[scanpy](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-017-1382-0).
+
+```{r rpackages}
+library(reticulate)
+library(tidyr)
+library(dplyr)
+library(Seurat)
+library(ggplot2)
+library(cowplot)
+library(DT)
+library(plotly)
+library(readr)
+library(UpSetR)
+library(future)
+library(parallel)
+library(SingleCellExperiment)
+library(scater)
+library(Seurat)
+library(scuttle)
+library(purrr)
+library(anndata)
+library(viridis)
+source('../helpers.R')
+use_condaenv('../../env')
+```
+
+```{python ppackages}
+# reticulate::repl_python()
+# Import packages
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import seaborn as sns
+import matplotlib.pyplot as plt
+import anndata as ad
+import scvi
+import os
+from IPython.display import display, HTML
+# Set seed number
+scvi.settings.seed = 0
+```
+
+
+```{r import_functions}
+# Import scanpy functions
+sc <- import("scanpy")
+```
+
+
+```{python configs}
+# Specify sample paths
+datatable_path = "sampletable.tsv"
+
+# Output directory
+output_dir = '../output/scanpy-qc-unintegrated-all'
+
+# Number of PCs to be accounted for UMAP
+npcs = 50
+
+# Assign resolution ranges for clustering
+resolutions = [0.6, 0.8, 1, 1.2, 1.4, 1.6, 1.8, 2.0]
+
+# Specify community detection algorithm
+# Options:
+# - leiden
+# - louvain
+comm_detection = 'leiden'
+
+# Specify the number of top variable features
+n_features = 3000
+
+# Create the output directory if it's not present yet
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+
+# Assign group levels
+group_levels = [
+    '5w_WT_M',
+    '5w_cKO_M',
+    '10w_WT_M',
+    '10w_cKO_M'
+    ]
+
+# Metadata variables to display in UMAP
+umap_variables = ['group', 'age', 'genotype']
+```
+
+# Datasets
+
+scRNA-seq analysis is performed on the following datasets.
+
+
+```{python dataset, results='asis'}
+
+# Import data table
+datatable = pd.read_csv(datatable_path, sep='\t', index_col='samplename')
+
+# Update file path to include filtered_feature_bc_matrix.h5
+datatable.loc[:, 'data_path'] = datatable.loc[:, 'data_path'].apply(lambda x: f"{x}/outs/filtered_feature_bc_matrix.h5")
+
+# Break if file paths don't correctly point to filtered_feature_bc_matrix.h5
+for sample in datatable.index:
+    p = datatable.loc[sample].data_path
+    split_path = p.split('/')
+    if 'filtered_feature_bc_matrix.h5' not in split_path:
+        raise ValueError('filtered_feature_bc_matrix.h5 not pointed in', p)
+```
+
+```{r print_metadata, results='asis'}
+data_table <- py$datatable %>%
+    dplyr::select(age, genotype, sex, rep, group)
+DT::datatable(data_table)
+```
+
+```{python import}
+# Create an empty dictionary storing adatas
+adatas = {}
+
+for sample in datatable.index:
+    # Import each h5 file
+    adata_i = sc.read_10x_h5(datatable.loc[sample, 'data_path'])
+    # Clean gene names
+    adata_i.var_names_make_unique()
+    # Add each dataset to the dictionary
+    adatas[sample] = adata_i
+
+# Merge dataset to a single anndata
+adata = ad.concat(adatas, label="samplename", join='outer')
+# Clean cell names
+adata.obs_names_make_unique()
+```
+
+
+# Quality Control (QC) {.tabset}
+
+QC is performed based on the following metrics:
+
+* `n_genes_by_counts`: the number of genes expressed in the count matrix
+* `total_counts`: the total counts per cell
+* `pct_counts_mito`: the percentage of counts in mitochondrial genes
+* `pct_counts_ribo`: the percentage of counts in ribosomal genes
+
+```{python qc, results='asis'}
+# Create a dictionary for the metrics of QC (keys) and strings (values) being matched
+qc_vars = {
+    "mito":('mt-', 'Mt_', 'MT-', 'mt:'),
+    "ribo":('RPS', 'Rps', 'RPL', 'Rpl')
+}
+
+# Loop over gene names to match whether each gene is mito or ribo genes
+for key, value in qc_vars.items():
+    adata.var[key] = adata.var_names.str.startswith(value)
+
+# print(adata)
+# print(sum(adata.var['mito']))
+# print(sum(adata.var['ribo']))
+
+# AnnData object with n_obs × n_vars = 101668 × 31054
+    # obs: 'samplename'
+    # var: 'mito', 'ribo'
+# 13
+# 105
+
+# Calculate percentage of expressed mito and ribo genes
+sc.pp.calculate_qc_metrics(adata, qc_vars=['mito', 'ribo'], inplace=True, log1p=True)
+
+```
+
+
+
+```{r qc_rdatai, results='asis', fig.width=8}
+
+# Bring adata to R
+adata <- py$adata
+
+# Clean the meta data frame
+adata.obs <- adata$obs %>%
+    gather('variable', 'value', -samplename)
+
+# > head(adata.obs, 2)
+#   samplename          variable value
+# 1  6w_WT_F_1 n_genes_by_counts  3880
+# 2  6w_WT_F_1 n_genes_by_counts  5206
+
+# Create a vector storing variable names to be plotted
+qc.vars <- c("n_genes_by_counts",
+             "total_counts",
+             "pct_counts_mito",
+             "pct_counts_ribo")
+
+qc.violin.list <- list()
+
+# Loop over the variables to create violin plots
+for (qc.var in qc.vars) {
+    cat('\n\n##', qc.var, '\n\n')
+    # Subset rows for each variable
+    df <- adata.obs %>% dplyr::filter(variable == qc.var)
+    if (nrow(df) > 0) {
+        p <- ggplot(
+                df,
+                aes(x=samplename, y=value, fill=samplename)) +
+            geom_violin(color='black') +
+            theme_bw() +
+            theme(legend.title=element_blank(),
+                  legend.position="none",
+                  axis.text.x=element_text(angle=90, vjust=0.5, hjust=1),
+                  axis.title.x=element_blank()) +
+            ylab(qc.var)
+        qc.violin.list[[qc.var]] <- p
+        print(p)
+    } else {
+        cat(paste('No records found in', qc.var))
+    cat('\n\n')
+    }
+}
+
+```
+
+## number of genes over count
+
+```{r qc_rdataii, results='asis', fig.width=8}
+# Create a scatter plot
+p <- ggplot(adata$obs,
+       aes(x=total_counts,
+           y=n_genes_by_counts,
+           color=samplename)) +
+    geom_point() +
+    theme_bw()
+
+print(p)
+```
+
+
+# Outlier filtering {.tabset}
+
+Here we use the `scuttle::isOutlier()` function on various metrics. This
+automatically selects a threshold, flagging cells that exceed **3 median absolute
+deviations (MAD)**. This avoids qualitative, *ad hoc* filtering choices, and lets use
+thresholds in a dataset-specific manner.
+
+Note that in cases where the lower value is negative and the metrics only take
+positive values, there will not be a negative threshold.
+
+The table shows the values; the plot shows horizontal lines for each threshold
+for each sample. Only metrics listed in the table (and those that have
+horizontal lines) are used for filtering purposes.
+
+
+```{r qcthresh}
+
+# Here, I will create a tibble storing outlier object per sample
+
+# Select columns of interest and nest by sample
+outlier.tibble <-adata$obs %>%
+    dplyr::select(samplename, n_genes_by_counts, total_counts,
+                  pct_counts_ribo, pct_counts_mito) %>%
+    group_by(samplename) %>%
+    nest()
+
+# Add outlier obj
+# NOTE: this workflow is designed to use scuttle::isOutlier() giving 3 MAD
+for (name in qc.vars) {
+    # Add a column storing outlier obj
+    outlier.tibble[[paste0(name, '_outlier')]] <- map(
+        outlier.tibble$data, ~isOutlier(as.numeric(.x[[name]]), type='both')
+        )
+    # Add columns storing lower/higher thresholds given by each outlier obj
+    for (direction in c('lower', 'higher')) {
+        outlier.tibble[[paste0(name, '_', direction)]] <- map_dbl(
+            outlier.tibble[[paste0(name, '_outlier')]],
+            ~attr(.x, 'thresholds')[direction]
+            )
+    }
+}
+
+```
+
+```{r qcthresh_summary, results='asis'}
+
+# Create a data frame storing only higher/lower thresholds per sample
+cutoff.df <- outlier.tibble %>%
+    dplyr::select(-data, -ends_with('outlier')) %>%
+    as.data.frame()
+
+cat('## Table {.tabset}\n\n')
+for (name in qc.vars) {
+    # Create a data frame indicating lower/higher thresholds per sample
+    df <- data.frame(
+        samplename=cutoff.df$samplename,
+        lower=round(cutoff.df[[paste0(name, '_lower')]], 5),
+        higher=round(cutoff.df[[paste0(name, '_higher')]], 5))
+
+    # Print the table
+    cat('###', name, '\n\n')
+    subchunkify(paste0(name, '_outlier_thresh'))
+    cat('\n\n')
+}
+
+
+```
+
+```{r qcthresh_plot, results='asis', fig.width=8}
+
+cat('## Plot {.tabset}\n\n')
+# Loop over the variables to create violin plots
+for (qc.var in qc.vars) {
+    cat('\n\n###', qc.var, '\n\n')
+    # Extract previously created violin plot
+    p <- qc.violin.list[[qc.var]]
+    if (!is.null(p)) {
+        # Slice cutoff data frame to contain columns for samplename and higher threshold
+        high.thresh <- cutoff.df[, c('samplename', paste0(qc.var, '_higher'))]
+        # Clean the column name
+        colnames(high.thresh)[2] <- 'higher'
+        # Add a horizontal line indicating the higher threshold
+        p <- p +
+            geom_hline(data=high.thresh,
+                       aes(yintercept=higher, color=samplename))
+        # Print
+        subchunkify(paste0(qc.var, '_qcplot'), input='plot')
+    } else {
+        cat(paste('No plots created in', qc.var))
+    cat('\n\n')
+    }
+}
+```
+
+```{r label_outliers}
+
+# Update the outlier.tibble to include whether each cell is outlier at each metric
+for (name in qc.vars) {
+    col <- paste0(name, '_outlier')
+    outlier.tibble[['data']] <- map(outlier.tibble[[col]], function(x) {
+        x <- as.data.frame(x)
+        colnames(x) <- col
+        # Convert all columns that inherit from the class 'outlier.filter' to logical vectors
+        x[[paste0(name, '_remove')]] <- as.logical(x[[col]])
+        return(x) }) %>%
+    # Update the `data` column to include each logical vector for the QC metric
+    map2(outlier.tibble$data, ~cbind(.y, .x))
+}
+
+# Update the python adata obj with the outlier columns
+py$adata$obs <- cbind(
+    py$adata$obs,
+    map(outlier.tibble$data, ~.x %>%
+           dplyr::select(ends_with('remove'))) %>% bind_rows()
+    )
+
+
+```
+
+# Doublet detection
+
+Scanpy runs [Scrublet](https://pubmed.ncbi.nlm.nih.gov/30954476/) to detect doublets 
+by default. Scrublet predicts cell doublets using a nearest-neighbor classifier of 
+observed transcriptomes and simulated doublets. 
+
+
+```{python doublet}
+# NOTE: scanpy.external.pp.scrublet() adds doublet_score and predicted_doublet to .obs. 
+# One can now either filter directly on predicted_doublet or use the doublet_score later 
+# during clustering to filter clusters with high doublet scores.
+sc.external.pp.scrublet(adata, batch_key='samplename', verbose=False)
+```
+
+```{r doublet_summary, results='asis'}
+
+# Update adata obj in R
+adata.obs <- py$adata$obs
+
+# Create a data frame summarizing the number and percentage of doublets 
+# per sample
+double.df <- adata.obs %>%
+    group_by(samplename) %>%
+    summarize(count=sum(predicted_doublet),
+              percent=round(count/n() * 100, 2)) %>%
+    # convert samplename from character to factor
+    mutate(samplename=factor(samplename,
+                             levels=levels(outlier.tibble$samplename))) %>%
+    # Reorder row by samplename
+    arrange(samplename)
+
+# Print
+DT::datatable(double.df)
+```
+
+
+
+# Filtering summary
+
+## UpSet plots {.tabset}
+
+Intersecting cells across the filtering metrics are counted and displayed 
+using UpSet plots.
+
+```{r filtering_upsetplot, results='asis'}
+
+# Create UpSet plot by sample
+for (name in levels(outlier.tibble$samplename)) {
+    # Subset metadata by sample
+    df <- adata.obs[adata.obs$samplename == name, ] %>%
+        # Create a column containing cell barcode
+        tibble::rownames_to_column('cell_id')
+
+    # Create an empty list storing cell_id per metric
+    upset.list <- list()
+    # For each metric
+    for (qcv in c('predicted_doublet', paste0(qc.vars, '_remove'))) {
+        # Determine index of each metric (for removal) being true
+        true.index <- df[[qcv]] == TRUE
+        # Determine cell barcodes being removed
+        cell_ids <- df$cell_id[true.index]
+        # Save the cell barcodes in the `upset.list`
+        upset.list[[qcv]] <- cell_ids
+    }
+
+    # Create and print an upset plot based on the barcodes
+    p <- upset(fromList(upset.list),
+               order.by='freq',
+               text.scale=c(2, 1.8, 1.3, 1.3, 2, 1.3),
+               point.size=3,
+               number.angles=15,
+               nsets=length(upset.list))
+    cat('###', name, '\n\n')
+    print(p)
+    cat('\n\n')
+}
+
+```
+
+## Table
+
+Here we summarize the number of cells that were filtered out based on 
+quality metrics and doublet detection.
+
+```{r filtering_table, results='asis'}
+
+# Create a vector assigning columns names having TRUE/FALSE for filtering
+filt.cols <- c('predicted_doublet',
+               paste0(qc.vars, '_remove'))
+
+# Add a column named `keep` indicating whether each cell will be kept (TRUE) or removed (FALSE)
+adata.obs[['keep']] <- ifelse(rowSums(adata.obs[,filt.cols]) == 0, TRUE, FALSE)
+
+# Clean the metadata in a new data frame
+remove.df <- adata.obs %>%
+    # Nest by sample
+    group_by(samplename) %>%
+    nest() %>%
+    # Add a column for the number of cells
+    mutate(raw=map_dbl(data, nrow))
+
+# Add a column storing the number of TRUE at each column
+for (col in c(filt.cols, 'keep')) {
+    remove.df[[col]] <- map_dbl(remove.df$data, ~sum(.x[[col]]))
+}
+
+# Clean the data frame
+remove.df <- remove.df %>%
+    dplyr::select(-data) %>%
+    # Add a column for the number of remaining cells
+    mutate(pct_kept=round(keep/raw * 100, 2),
+           pct_removed=round(100-pct_kept, 2)) %>%
+    dplyr::select(-pct_kept) %>%
+    as.data.frame()
+
+DT::datatable(remove.df)
+
+# NOTE: Here, we update python adata to contain 'keep' column
+py$adata$obs[['keep']] <- adata.obs[rownames(py$adata$obs), 'keep'] 
+```
+
+
+```{r save_qc_adata, eval=TRUE}
+write_h5ad(py$adata, file.path(py$output_dir, "adata_qc.h5ad"))
+```
+
+```{python remove_outlier_cells}
+# Remove outlier cells
+adata = adata[adata.obs['keep']]
+
+print(f"Remaining cells {adata.n_obs} - proceeded to the next step!")
+```
+
+# Normalization
+
+The next preprocessing step is normalization. A common approach is count depth 
+scaling with subsequent log plus one (log1p) transformation. 
+
+```{python normalization}
+
+# NOTE:
+# The size factor for count depth scaling can be controlled via target_sum in pp.normalize_total. 
+# We are applying median count depth normalization with log1p transformation (AKA log1PF).
+
+# Saving raw count data
+adata.layers["counts"] = adata.X.copy()
+
+# Normalizing to median total counts:
+# - Normalize each cell by total counts over all genes, so that every cell has 
+#   the same total count after normalization. 
+# - If choosing target_sum=1e6, this is CPM normalization.
+# - If exclude_highly_expressed=True, very highly expressed genes are excluded from 
+#    the computation of the normalization factor (size factor) for each cell. This is 
+#    meaningful as these can strongly influence the resulting normalized values for all 
+#    other genes
+# - Count depth scaling normalizes the data to a “size factor” such as the median 
+#    count depth in the dataset, ten thousand (CP10k) or one million 
+#    (CPM, counts per million).
+# - doc: https://scanpy.readthedocs.io/en/stable/generated/scanpy.pp.normalize_total.html
+sc.pp.normalize_total(adata, exclude_highly_expressed=True)
+
+# Logarithmize the data
+sc.pp.log1p(adata)
+
+```
+
+# Feature Selection
+
+As a next step, we want to reduce the dimensionality of the dataset and only include 
+the most informative genes. This step is commonly known as feature selection. 
+
+```{python feature_selection, results='asis', fig.width=8}
+
+# Compute highly variable genes
+sc.pp.highly_variable_genes(adata, n_top_genes=n_features, batch_key="samplename")
+
+# Plot highly variable genes
+sc.pl.highly_variable_genes(adata)
+```
+
+
+# Dimensionality Reduction
+
+
+## PCA
+
+Reduce the dimensionality of the data by running principal component analysis (PCA), 
+which reveals the main axes of variation and denoises the data. 
+
+The following scree plot inspects the contribution of single PCs to the total variance 
+in the data. This gives us information about how many PCs we should consider in order to 
+compute the neighborhood relations of cells, e.g. used in the clustering function 
+leiden() or tsne(). In our experience, often a rough estimate of the number of PCs 
+does fine.
+
+```{python pca, results='asis'}
+# Run PCA
+sc.tl.pca(adata)
+
+# Print scree plot
+sc.pl.pca_variance_ratio(adata, n_pcs=npcs, log=True)
+```
+
+## UMAP {.tabset}
+
+Let us compute the neighborhood graph of cells using the PCA representation of the data 
+matrix. We embed the graph in two dimensions using UMAP (McInnes et al., 2018).
+
+
+```{python umap}
+# reticulate::repl_python()
+sc.pp.neighbors(adata, n_pcs=npcs)
+sc.tl.umap(adata)
+```
+
+
+# Clustering
+
+Here, cells are clustered into subgroups through community detection algorithms. Two major 
+algorithms that are introduced scanpy tutorials are 
+[Laiden](https://pubmed.ncbi.nlm.nih.gov/30914743) and 
+[Louvain](https://iopscience.iop.org/article/10.1088/1742-5468/2008/10/P10008).
+
+In the current workflow, clustering is performed using `r py$comm_detection`.
+
+```{python unintegrated_clustering}
+for n in resolutions:
+    if comm_detection == 'leiden':
+        sc.tl.leiden(adata, resolution=n, key_added=f"{comm_detection}_{n}")
+    elif comm_detection == 'louvain':
+        sc.tl.louvain(adata, resolution=n, key_added=f"{comm_detection}_{n}")
+    else:
+        raise ValueError("Wrong community detection algorithm!")
+
+```
+
+```{r clustering_options}
+
+print(paste('Clustering method:', py$comm_detection))
+
+print('Resolutions:')
+for (n in unlist(py$resolutions)) {
+    print(n)
+}
+```
+
+
+```{r prep_umap}
+
+# Create a vector storing names of metadata variables to be plotted
+umap.variables <- c(
+    'samplename',
+    'n_genes_by_counts',
+    'total_counts',
+    'pct_counts_mito',
+    'pct_counts_ribo',
+    'doublet_score')
+
+
+# Extract umap coordinates from adata
+umap <- py$adata$obsm$X_umap
+
+# Extract metadata from adata
+meta <- py$adata$obs
+
+# Build input data frame for plotting
+u.df <- do.call(
+    "cbind",
+    list(as.data.frame(umap),
+         meta[,umap.variables],
+         meta %>% dplyr::select(starts_with(py$comm_detection)))
+    ) %>%
+    separate(samplename, c('age', 'genotype', 'sex', 'rep'), remove=FALSE) %>%
+    mutate(group=paste(age, genotype, sex, sep="_"),
+           group=factor(group, levels=py$group_levels))
+
+# Clean column names
+colnames(u.df)[1:2] <- c("UMAP1", "UMAP2")
+
+# Add the group column to metadata in the original adata obj
+for (name in py$umap_variables) {
+    py$adata$obs[[name]] <- u.df[[name]]
+}
+
+# Add user-defined UMAP variables
+if (sum(py$umap_variables %in% colnames(u.df))) {
+    col.added <- py$umap_variables[py$umap_variables %in% colnames(u.df)]
+    umap.variables <- c(umap.variables, col.added)
+}
+```
+
+## UMAP {.tabset}
+
+
+```{r unintegrated_umap, results='asis', fig.height=8, fig.width=10}
+
+# Print UMAP by metadata variable
+cols.plotted <- colnames(u.df %>% dplyr::select(-starts_with('UMAP')))
+
+for (name in cols.plotted) {
+
+    cat('###', name, '\n\n')
+    p <- ggplot(u.df, aes_string(x='UMAP1', y='UMAP2', color=name)) +
+        geom_point(size=0.1) +
+        theme_bw()
+
+    u.df2 <- u.df %>%
+        group_by_at(vars(name)) %>%
+        select(starts_with('UMAP')) %>%
+        summarize_all(mean)
+
+    if (! class(u.df[[name]]) %in% c("factor", "character")) {
+        p <- p + scale_color_viridis()
+    }
+
+    if (stringr::str_detect(name, py$comm_detection)) {
+        p <- p + geom_text(data=u.df2, color='black',
+                           aes_string(label=name))
+    }
+    cat('\n\n')
+    print(p)
+    cat('\n\n')
+
+    file.i <- file.path(py$output_dir,
+                        paste0(name, '_unintegrated_umap.pdf')
+                        )
+
+    ggsave(file.i, p, device='pdf', height=8, width=10)
+    link.plot(file.i)
+
+}
+
+
+```
+
+```{r save_unintegrated_adata}
+write_h5ad(py$adata, file.path(py$output_dir, "adata_unintegrated.h5ad"))
+```
+
+
+# Session info
+
+```{r session_info, collapse=FALSE}
+sessionInfo()
+```
