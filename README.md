@@ -35,7 +35,7 @@ is pointed.
 - `scanpy/scripts/scanpy-unintegrated-markers-all.Rmd`: 
     - Marker gene computation
 - `scanpy/scripts/scanpy-integration-all.Rmd`: 
-    - Integration based on variational autoencoder-based using
+    - Integration based on deep learning using
     [scVI](https://pubmed.ncbi.nlm.nih.gov/30504886/)
 - `scanpy/scripts/scanpy-integrated-markers-all.Rmd`: 
     - Marker gene computation
