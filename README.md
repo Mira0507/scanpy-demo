@@ -21,23 +21,28 @@ $ tree
         └── scanpy-unintegrated-markers-all.Rmd
 ```
 
+### Supporting files
+
 - `env.yaml`: conda environment
 - `scanpy/helpers.R`: helper functions
 - `scanpy/scripts/sampletable.tsv`: sampletable pointing to input `h5` files generated 
 by 10x Genomics [CellRanger](https://www.10xgenomics.com/support/software/cell-ranger/latest).
-With no further modification, the parental directory of `outs/filtered_feature_bc_matrix.h5`
-is pointed.
-- `scanpy/scripts/scanpy-qc-unintegrated-all.Rmd`: 
+By default, it references the parent directory of `outs/filtered_feature_bc_matrix.h5`
+without further modification.
+
+### Analysis scripts
+
+- `scanpy/scripts/scanpy-qc-unintegrated-all.Rmd`
     - Quality control (removing doublet and outlier cells)
     - Normalization
     - Dimensionality reduction
     - Clustering
-- `scanpy/scripts/scanpy-unintegrated-markers-all.Rmd`: 
+- `scanpy/scripts/scanpy-unintegrated-markers-all.Rmd` 
     - Marker gene computation
-- `scanpy/scripts/scanpy-integration-all.Rmd`: 
+- `scanpy/scripts/scanpy-integration-all.Rmd` 
     - Integration based on deep learning using
     [scVI](https://pubmed.ncbi.nlm.nih.gov/30504886/)
-- `scanpy/scripts/scanpy-integrated-markers-all.Rmd`: 
+- `scanpy/scripts/scanpy-integrated-markers-all.Rmd`
     - Marker gene computation
 
 ## Setup 
@@ -81,3 +86,5 @@ This will create a new conda environment named `env` in the current directory.
 
 ## Analysis
 
+Analysis is conducted by following the order listed under 
+[Analysis scripts](###analysis-scripts).
