@@ -86,5 +86,5 @@ This will create a new conda environment named `env` in the current directory.
 
 ## Analysis
 
-Analysis is conducted by following the order listed under 
+The analysis is conducted by following the order listed under 
 [Analysis scripts](###analysis-scripts).
